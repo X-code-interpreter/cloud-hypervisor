@@ -202,6 +202,12 @@ pub struct MemoryManager {
     uefi_flash: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
 }
 
+pub struct RestoreMemoryRanges<'a> {
+    range_table: &'a MemoryRangeTable,
+    mmaped_bitmap: Vec<bool>,
+    memfile_path: PathBuf,
+}
+
 #[derive(Debug)]
 pub enum Error {
     /// Failed to create shared file.
@@ -436,6 +442,25 @@ where
     (val & (align - 1u8.into())) == 0u8.into()
 }
 
+impl RestoreMemoryRanges<'_> {
+    pub fn new(table: &MemoryRangeTable, path: PathBuf) -> RestoreMemoryRanges {
+        RestoreMemoryRanges {
+            range_table: table,
+            mmaped_bitmap: vec![false; table.regions().len()],
+            memfile_path: path,
+        }
+    }
+
+    fn to_fill_ranges(&self) -> impl Iterator<Item = &MemoryRange> {
+        self.range_table
+            .regions()
+            .iter()
+            .zip(self.mmaped_bitmap.iter())
+            .filter(|(_, &mmaped)| !mmaped)
+            .map(|(range, _)| range)
+    }
+}
+
 impl BusDevice for MemoryManager {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
         if self.selected_slot < self.hotplug_slots.len() {
@@ -656,6 +681,34 @@ impl MemoryManager {
         Ok((mem_regions, memory_zones))
     }
 
+    /// Return: (index within range table, offset)
+    fn lookup_offset_within_memory_file(
+        memory_range_table: &MemoryRangeTable,
+        guest_ram_mapping: &GuestRamMapping,
+    ) -> Option<(usize, u64)> {
+        // The memory_range_table in snapshot file was generated
+        // through each region of memory_zones.
+        // Thus it was supposed to match exactly with the guest_ram_mapping
+        let mut file_offset = 0;
+        for (idx, range) in memory_range_table.regions().iter().enumerate() {
+            if range.gpa <= guest_ram_mapping.gpa
+                && range.gpa + range.length >= guest_ram_mapping.gpa + guest_ram_mapping.size
+            {
+                if range.gpa != guest_ram_mapping.gpa
+                    || range.gpa + range.length != guest_ram_mapping.gpa + guest_ram_mapping.size
+                {
+                    warn!(
+                        "find memory_range ({:#x}) contains guest_ram_mapping{:#x}",
+                        range.gpa, guest_ram_mapping.gpa
+                    );
+                }
+                return Some((idx, file_offset + guest_ram_mapping.gpa - range.gpa));
+            }
+            file_offset += range.length;
+        }
+        None
+    }
+
     // Restore both GuestMemory regions along with MemoryZone zones.
     fn restore_memory_regions_and_zones(
         guest_ram_mappings: &[GuestRamMapping],
@@ -663,6 +716,7 @@ impl MemoryManager {
         prefault: Option<bool>,
         mut existing_memory_files: HashMap<u32, File>,
         thp: bool,
+        restore_memory_ranges: &mut RestoreMemoryRanges,
     ) -> Result<(Vec<Arc<GuestRegionMmap>>, MemoryZones), Error> {
         let mut memory_regions = Vec::new();
         let mut memory_zones = HashMap::new();
@@ -674,13 +728,42 @@ impl MemoryManager {
         for guest_ram_mapping in guest_ram_mappings {
             for zone_config in zones_config {
                 if guest_ram_mapping.zone_id == zone_config.id {
+                    let mut file_offset = guest_ram_mapping.file_offset;
+                    let backing_file = if guest_ram_mapping.virtio_mem {
+                        None
+                    } else {
+                        match &zone_config.file {
+                            None => {
+                                if zone_config.shared {
+                                    // we only support private anon mappings
+                                    None
+                                } else if let Some((idx, offset)) =
+                                    Self::lookup_offset_within_memory_file(
+                                        restore_memory_ranges.range_table,
+                                        guest_ram_mapping,
+                                    )
+                                {
+                                    info!(
+                                        "private mapping {:#x} - {:#x} restore to {:?} at {:#x}",
+                                        guest_ram_mapping.gpa,
+                                        guest_ram_mapping.gpa + guest_ram_mapping.size,
+                                        restore_memory_ranges.memfile_path,
+                                        offset,
+                                    );
+                                    file_offset = offset;
+                                    restore_memory_ranges.mmaped_bitmap[idx] = true;
+                                    Some(restore_memory_ranges.memfile_path.clone())
+                                } else {
+                                    None
+                                }
+                            }
+                            Some(p) => Some(p.clone()),
+                        }
+                    };
+
                     let region = MemoryManager::create_ram_region(
-                        if guest_ram_mapping.virtio_mem {
-                            &None
-                        } else {
-                            &zone_config.file
-                        },
-                        guest_ram_mapping.file_offset,
+                        &backing_file,
+                        file_offset,
                         GuestAddress(guest_ram_mapping.gpa),
                         guest_ram_mapping.size as usize,
                         prefault.unwrap_or(zone_config.prefault),
@@ -718,21 +801,25 @@ impl MemoryManager {
 
     fn fill_saved_regions(
         &mut self,
-        file_path: PathBuf,
-        saved_regions: MemoryRangeTable,
+        restore_memory_ranges: RestoreMemoryRanges,
     ) -> Result<(), Error> {
-        if saved_regions.is_empty() {
+        if restore_memory_ranges.range_table.is_empty() {
             return Ok(());
         }
 
         // Open (read only) the snapshot file.
         let mut memory_file = OpenOptions::new()
             .read(true)
-            .open(file_path)
+            .open(&restore_memory_ranges.memfile_path)
             .map_err(Error::SnapshotOpen)?;
 
         let guest_memory = self.guest_memory.memory();
-        for range in saved_regions.regions() {
+        for range in restore_memory_ranges.to_fill_ranges() {
+            info!(
+                "fill saved region {:#x} - {:#x}",
+                range.gpa,
+                range.gpa + range.length
+            );
             let mut offset: u64 = 0;
             // Here we are manually handling the retry in case we can't write
             // the whole region at once because we can't use the implementation
@@ -991,6 +1078,7 @@ impl MemoryManager {
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: Option<HashMap<u32, File>>,
         #[cfg(target_arch = "x86_64")] sgx_epc_config: Option<Vec<SgxEpcConfig>>,
+        restore_memory_ranges: Option<&mut RestoreMemoryRanges>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         trace_scoped!("MemoryManager::new");
 
@@ -1027,6 +1115,7 @@ impl MemoryManager {
                 prefault,
                 existing_memory_files.unwrap_or_default(),
                 config.thp,
+                restore_memory_ranges.unwrap(),
             )?;
             let guest_memory =
                 GuestMemoryMmap::from_arc_regions(regions).map_err(Error::GuestMemory)?;
@@ -1274,6 +1363,8 @@ impl MemoryManager {
             let mem_snapshot: MemoryManagerSnapshotData =
                 snapshot.to_state().map_err(Error::Restore)?;
 
+            let mut restore_memory_ranges =
+                RestoreMemoryRanges::new(&mem_snapshot.memory_ranges, memory_file_path.clone());
             let mm = MemoryManager::new(
                 vm,
                 config,
@@ -1285,11 +1376,12 @@ impl MemoryManager {
                 None,
                 #[cfg(target_arch = "x86_64")]
                 None,
+                Some(&mut restore_memory_ranges),
             )?;
 
             mm.lock()
                 .unwrap()
-                .fill_saved_regions(memory_file_path, mem_snapshot.memory_ranges)?;
+                .fill_saved_regions(restore_memory_ranges)?;
 
             Ok(mm)
         } else {

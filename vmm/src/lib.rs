@@ -896,6 +896,7 @@ impl Vmm {
             existing_memory_files,
             #[cfg(target_arch = "x86_64")]
             None,
+            None,
         )
         .map_err(|e| {
             MigratableError::MigrateReceive(anyhow!(
