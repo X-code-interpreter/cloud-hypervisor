@@ -57,6 +57,8 @@ const KVM_FEATURE_ASYNC_PF_VMEXIT_BIT: u8 = 10;
 #[cfg(feature = "tdx")]
 const KVM_FEATURE_STEAL_TIME_BIT: u8 = 5;
 
+const KVM_FEATURE_ASYNC_PF_INT: u8 = 14;
+
 pub const _NSIG: i32 = 65;
 
 #[derive(Debug, Copy, Clone)]
@@ -744,6 +746,13 @@ pub fn generate_common_cpuid(
                 entry.eax = (entry.eax & 0xffff_ff00) | (config.phys_bits as u32 & 0xff);
             }
             0x4000_0001 => {
+                // NOTE(by huang-jl):
+                // related to https://github.com/cloud-hypervisor/cloud-hypervisor/issues/2277
+                // There are many HLT VMExit when testing on both Linux 6.12.17 and ubuntu 24
+                // 6.8.0.
+                //
+                // Re-enable the patch seems work.
+                entry.eax &= !(1 << KVM_FEATURE_ASYNC_PF_INT);
                 // These features are not supported by TDX
                 #[cfg(feature = "tdx")]
                 if config.tdx {
